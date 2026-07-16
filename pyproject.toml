@@ -1,0 +1,17 @@
+[project]
+name = "portfolio-chatbot"
+version = "1.0.0"
+description = "Chatbot API for portfolio website"
+requires-python = ">=3.12"
+dependencies = [
+    "flask",
+    "flask-cors",
+    "pinecone",
+    "openai",
+    "python-dotenv",
+    "huggingface_hub",
+    "numpy"
+]
+
+[tool.vercel]
+entrypoint = "app:app"

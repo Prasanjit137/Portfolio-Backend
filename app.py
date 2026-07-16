@@ -1,127 +1,86 @@
 import os
 import warnings
-import sys
+import logging
 from dotenv import load_dotenv
-
-# 1. Clear out internal package syntax warnings completely
-warnings.filterwarnings("ignore", category=SyntaxWarning)
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
-from sentence_transformers import SentenceTransformer
-import chromadb
-# Import Settings to natively kill telemetry on initialization
-from chromadb.config import Settings
-from chromadb.utils import embedding_functions
+from pinecone import Pinecone
 from openai import OpenAI
+from huggingface_hub import InferenceClient
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
+warnings.filterwarnings("ignore", category=SyntaxWarning)
 
-# ---------- CONFIGURATION ----------
+# ---------- CONFIG ----------
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
-YOUR_WEBSITE_URL = os.getenv("YOUR_WEBSITE_URL")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
+HF_API_KEY = os.getenv("HF_API_KEY")
+HF_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Global dictionary to track conversation history per sessionId
 conversations_memory = {}
-MAX_HISTORY_TURNS = 6  # Kept concise for speed and focus
+MAX_HISTORY_TURNS = 6
 
-# ---------- 1. DYNAMIC REACT SCRAPER ----------
-def scrape_dynamic_react_site(url):
-    print(f"🌐 Headless browser parsing React application: {url}")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(url, wait_until="networkidle")
-        html_content = page.content()
-        browser.close()
-        
-    soup = BeautifulSoup(html_content, 'html.parser')
-    for tag in soup(['script', 'style', 'noscript', 'nav', 'footer']):
-        tag.decompose()
-        
-    return soup.get_text(separator='\n', strip=True)
+# ---------- PINECONE ----------
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index = pc.Index(INDEX_NAME)
 
-# ---------- 2. CONTEXTUAL CHUNKING ----------
-def chunk_text(text, chunk_size=300):
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    chunks = []
-    current_chunk = []
-    current_words = 0
+# ---------- EMBEDDING VIA HUGGING FACE ----------
+client = InferenceClient(token=HF_API_KEY) if HF_API_KEY else InferenceClient()
+
+def get_embedding(text):
+    """
+    Generate embedding for a single text using Hugging Face InferenceClient.
+    Returns a flat list of floats.
+    """
+    logger.info(f"Generating embedding for: {text[:50]}...")
+    embedding = client.feature_extraction(text, model=HF_MODEL)
     
-    for line in lines:
-        words = line.split()
-        if current_words + len(words) > chunk_size:
-            chunks.append(" ".join(current_chunk))
-            current_chunk = words
-            current_words = len(words)
-        else:
-            current_chunk.extend(words)
-            current_words += len(words)
-            
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
-    return chunks
+    if hasattr(embedding, 'tolist'):
+        embedding = embedding.tolist()
+    
+    if isinstance(embedding, list) and len(embedding) == 1 and isinstance(embedding[0], list):
+        embedding = embedding[0]
+    
+    if not isinstance(embedding, list):
+        raise TypeError(f"Expected list, got {type(embedding)}")
+    
+    return embedding
 
-# ---------- INITIALIZATION SEQUENCE ----------
-print("--- 🤖 Initializing RAG Backend Engine ---")
-try:
-    raw_text = scrape_dynamic_react_site(YOUR_WEBSITE_URL)
-    site_chunks = chunk_text(raw_text)
-    print(f"✅ Ingested {len(site_chunks)} web layouts data chunks successfully.")
-except Exception as e:
-    print(f"❌ Initial site context recovery failed: {e}")
-    sys.exit(1)
-
-# Initialize ChromaDB with telemetry explicitly turned off in Settings
-chroma_client = chromadb.PersistentClient(
-    path="./chroma_db",
-    settings=Settings(anonymized_telemetry=False)
-)
-
-try:
-    chroma_client.delete_collection(name="dynamic_portfolio")
-except Exception:
-    pass
-
-collection = chroma_client.get_or_create_collection(
-    name="dynamic_portfolio",
-    embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-)
-
-collection.add(documents=site_chunks, ids=[f"live_chunk_{i}" for i in range(len(site_chunks))])
-print("✅ Vector index completely loaded into memory. Server engine active.\n")
-
-# ---------- 3. CHAT API ROUTE WITH MEMORY ----------
+# ---------- CHAT ENDPOINT ----------
 @app.route('/chat', methods=['POST'])
 def chat_endpoint():
     try:
         data = request.json
         if not data or 'chatInput' not in data:
-            return jsonify({"text": "Missing parameter payload inputs."}), 400
-            
+            return jsonify({"text": "Missing parameter."}), 400
+
         user_query = data['chatInput']
-        session_id = data.get('sessionId', 'anonymous') 
-        
-        if session_id not in conversations_memory:
-            conversations_memory[session_id] = []
-            
-        # 1. Safe context retrieval
-        results = collection.query(query_texts=[user_query], n_results=3)
+        session_id = data.get('sessionId', 'anonymous')
+
+        logger.info(f"Received query: {user_query} from session {session_id}")
+
+        # 1. Embed user query
+        query_emb = get_embedding(user_query)
+
+        # 2. Query Pinecone
+        results = index.query(vector=query_emb, top_k=3, include_metadata=True)
         retrieved_docs = []
-        
-        if results and isinstance(results, dict):
-            docs_list = results.get('documents')
-            if docs_list and len(docs_list) > 0 and docs_list[0] is not None:
-                retrieved_docs = docs_list[0]
-                
+        if results and results.get('matches'):
+            for match in results['matches']:
+                retrieved_docs.append(match['metadata']['text'])
         context = "\n\n".join(retrieved_docs) if retrieved_docs else "[No explicit context found]"
-        
-        # 2. Strict system instructions for short, straightforward replies
+
+        logger.info(f"Retrieved {len(retrieved_docs)} documents from Pinecone")
+
+        # 3. Build system prompt
         system_prompt = (
             "You are an intelligent assistant trained on the structure of this portfolio website. "
             "Answer the user query based purely on the website context provided below. "
@@ -130,40 +89,38 @@ def chat_endpoint():
             "If the information is not present in the context, state exactly: 'I don't have that information on the website.'\n\n"
             f"Website Context:\n{context}"
         )
-        
-        api_messages = [{"role": "system", "content": system_prompt}]
-        
-        for past_message in conversations_memory[session_id]:
-            api_messages.append(past_message)
-            
-        api_messages.append({"role": "user", "content": user_query})
-        
-        # 3. Call OpenRouter Gateway using Nemotron
-        client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_KEY)
-        response = client.chat.completions.create(
+
+        # 4. Manage conversation history
+        if session_id not in conversations_memory:
+            conversations_memory[session_id] = []
+
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(conversations_memory[session_id])
+        messages.append({"role": "user", "content": user_query})
+
+        # 5. Call OpenRouter
+        client_openai = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_KEY)
+        response = client_openai.chat.completions.create(
             model="nvidia/nemotron-3-ultra-550b-a55b:free",
-            messages=api_messages,
-            max_tokens=150,       # Caps lengths forcefully
-            temperature=0.3       # Low temperature keeps answers sharp and factual
+            messages=messages,
+            max_tokens=150,
+            temperature=0.3
         )
-        
         ai_response = response.choices[0].message.content.strip()
-        
-        # 4. Commit to Session Memory
+
+        logger.info(f"Generated response: {ai_response}")
+
+        # 6. Update memory
         conversations_memory[session_id].append({"role": "user", "content": user_query})
         conversations_memory[session_id].append({"role": "assistant", "content": ai_response})
-        
         if len(conversations_memory[session_id]) > MAX_HISTORY_TURNS:
             conversations_memory[session_id] = conversations_memory[session_id][-MAX_HISTORY_TURNS:]
-        
-        return jsonify({
-            "output": ai_response, 
-            "text": ai_response
-        })
-        
+
+        return jsonify({"output": ai_response, "text": ai_response})
+
     except Exception as e:
-        print(f"❌ Session handler failed context parsing execution: {e}")
-        return jsonify({"text": "Internal error handling text frame transformation."}), 500
+        logger.exception("Chat endpoint error")
+        return jsonify({"text": "Internal error."}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000, debug=False)
