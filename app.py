@@ -127,6 +127,10 @@ def chat_endpoint():
         logger.exception("Chat endpoint error")
         return jsonify({"text": f"Internal error: {str(e)}"}), 500
 
+@app.route('/ping', methods=['GET'])
+def ping():
+    return jsonify({"status": "awake"}), 200
+
 if __name__ == '__main__':
     port = int(os.getenv("PORT", 7860))
     app.run(host='0.0.0.0', port=port, debug=False)
