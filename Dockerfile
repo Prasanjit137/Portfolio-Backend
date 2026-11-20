@@ -9,14 +9,14 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first to leverage Docker cache
-COPY requirements.txt .
+# --- Install CPU-only PyTorch FIRST from the official index ---
+RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 
-# Install Python dependencies
+# Copy requirements and install the rest
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # --- Pre-download the SentenceTransformer model during build ---
-# This bakes the model into the image, so no download happens at runtime.
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
 
 # Copy the rest of the application code

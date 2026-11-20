@@ -5,7 +5,3 @@ pinecone-client
 openai
 sentence-transformers
 gunicorn
-
-# Force CPU-only PyTorch to keep the image size small (~150MB instead of 2.5GB)
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.2.0+cpu
