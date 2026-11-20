@@ -6,7 +6,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pinecone import Pinecone
 from openai import OpenAI
-from huggingface_hub import InferenceClient
+from sentence_transformers import SentenceTransformer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,8 +19,10 @@ warnings.filterwarnings("ignore", category=SyntaxWarning)
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
-HF_API_KEY = os.getenv("HF_API_KEY")
-HF_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+logger.info(f"OPENROUTER_KEY: {'SET' if OPENROUTER_KEY else 'MISSING'}")
+logger.info(f"PINECONE_API_KEY: {'SET' if PINECONE_API_KEY else 'MISSING'}")
+logger.info(f"INDEX_NAME: {INDEX_NAME}")
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -32,27 +34,28 @@ MAX_HISTORY_TURNS = 6
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(INDEX_NAME)
 
-# ---------- EMBEDDING VIA HUGGING FACE ----------
-client = InferenceClient(token=HF_API_KEY) if HF_API_KEY else InferenceClient()
+# ---------- EMBEDDING (LOCAL MODEL) ----------
+# The model is pre-downloaded during the Docker build, so this loads from local cache.
+try:
+    logger.info("Loading local embedding model...")
+    embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    logger.info("Embedding model loaded successfully.")
+except Exception as e:
+    logger.error(f"Failed to load embedding model: {e}")
+    embedding_model = None
 
 def get_embedding(text):
     """
-    Generate embedding for a single text using Hugging Face InferenceClient.
+    Generate embedding for a single text using the locally loaded SentenceTransformer.
     Returns a flat list of floats.
     """
-    logger.info(f"Generating embedding for: {text[:50]}...")
-    embedding = client.feature_extraction(text, model=HF_MODEL)
+    if embedding_model is None:
+        raise RuntimeError("Embedding model is not available.")
     
-    if hasattr(embedding, 'tolist'):
-        embedding = embedding.tolist()
-    
-    if isinstance(embedding, list) and len(embedding) == 1 and isinstance(embedding[0], list):
-        embedding = embedding[0]
-    
-    if not isinstance(embedding, list):
-        raise TypeError(f"Expected list, got {type(embedding)}")
-    
-    return embedding
+    logger.info(f"Generating embedding locally for: {text[:50]}...")
+    # encode() returns a numpy array; convert to list for Pinecone
+    embedding = embedding_model.encode(text, convert_to_numpy=True)
+    return embedding.tolist()
 
 # ---------- CHAT ENDPOINT ----------
 @app.route('/chat', methods=['POST'])
@@ -67,7 +70,7 @@ def chat_endpoint():
 
         logger.info(f"Received query: {user_query} from session {session_id}")
 
-        # 1. Embed user query
+        # 1. Embed user query locally
         query_emb = get_embedding(user_query)
 
         # 2. Query Pinecone
@@ -98,6 +101,8 @@ def chat_endpoint():
         messages.extend(conversations_memory[session_id])
         messages.append({"role": "user", "content": user_query})
 
+        logger.info(f"Calling OpenRouter with key: {'SET' if OPENROUTER_KEY else 'MISSING'}")
+        
         # 5. Call OpenRouter
         client_openai = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_KEY)
         response = client_openai.chat.completions.create(
@@ -120,7 +125,8 @@ def chat_endpoint():
 
     except Exception as e:
         logger.exception("Chat endpoint error")
-        return jsonify({"text": "Internal error."}), 500
+        return jsonify({"text": f"Internal error: {str(e)}"}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000, debug=False)
+    port = int(os.getenv("PORT", 7860))
+    app.run(host='0.0.0.0', port=port, debug=False)
